@@ -1,0 +1,31 @@
+services:
+  freqtrade:
+    image: freqtradeorg/freqtrade:2026.3_freqai
+    restart: unless-stopped
+    container_name: retailedge_freqtrade
+    volumes:
+      - "./freqtrade/user_data:/freqtrade/user_data"
+    ports:
+      - "127.0.0.1:8080:8080"
+    command: >
+      trade
+      --logfile /freqtrade/user_data/logs/freqtrade.log
+      --db-url sqlite:////freqtrade/user_data/tradesv3.sqlite
+      --config /freqtrade/user_data/config.json
+      --strategy RetailEdgeStrategy
+    env_file:
+      - .env
+
+  sidecar:
+    image: python:3.11-slim
+    container_name: retailedge_sidecar
+    volumes:
+      - "./sidecar:/app"
+      - "./ledger:/ledger"
+    working_dir: /app
+    command: sleep infinity
+    depends_on:
+      - freqtrade
+    env_file:
+      - .env
+    restart: unless-stopped

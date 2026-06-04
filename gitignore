@@ -1,0 +1,24 @@
+# Environment
+.env
+
+# Database
+*.db
+*.sqlite
+
+# FreqAI models
+freqtrade/user_data/models/
+
+# Logs
+freqtrade/user_data/logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Generated config (always rebuilt by config_compiler.py)
+freqtrade/user_data/config.generated.json
+
+# OS
+.DS_Store
