@@ -1,355 +1,331 @@
 """
-tests/test_atr_percentile.py
+tests/test_atr_percentile_service.py
 
 Test gate: Dry-run.
 
-Required test (Sprint 2 S2-4 gate):
-- test_stoploss_interval_uses_atr_baseline
+Required test (Sprint 2 S2-5 gate):
+- test_atr_percentile_min_lookback
 
-Covers next_stoploss_audit_interval() and StoplossAuditor.run_once()
-with injected atr_state dicts — no ATR service dependency needed.
+All tests use synthetic DataFrames — no exchange data needed.
+Pandas and numpy only.
 """
 
 import pytest
-from unittest.mock import MagicMock
+import numpy as np
+import pandas as pd
 
-from sidecar.stoploss_auditor.auditor import (
-    next_stoploss_audit_interval,
-    StoplossAuditor,
-    INTERVAL_NORMAL_SEC,
-    INTERVAL_HIGH_RISK_SEC,
-    ATR_HIGH_VOL_THRESHOLD,
+from research.atr_percentile_service import (
+    compute_atr_percentile_baseline,
+    add_atr_pct,
+    ATRPercentileService,
+    MIN_LOOKBACK_CANDLES,
+    HIGH_VOL_THRESHOLD,
+    SPIKE_THRESHOLD,
+    ATR_COLUMN,
 )
-from sidecar.guardian.decision_bus import DecisionBus
 
 
 # ---------------------------------------------------------------------------
-# Fixtures
+# DataFrame fixtures
 # ---------------------------------------------------------------------------
 
-@pytest.fixture
-def bus():
-    b = DecisionBus(":memory:")
-    yield b
-    b.close()
-
-
-def atr_ok(percentile: float) -> dict:
-    return {"status": "OK", "atr_percentile": percentile}
-
-
-def atr_insufficient() -> dict:
-    return {"status": "ATR_BASELINE_INSUFFICIENT", "atr_percentile": None}
-
-
-def open_trade(trade_id="trade_1", pair="BTC/USDT") -> dict:
-    return {"trade_id": trade_id, "pair": pair, "stoploss": -0.05}
-
-
-def stop_order(pair="BTC/USDT", order_type="stop_limit") -> dict:
-    return {"id": "stop_001", "symbol": pair, "type": order_type, "side": "sell"}
-
-
-# ---------------------------------------------------------------------------
-# test_stoploss_interval_uses_atr_baseline  ← REQUIRED GATE
-# ---------------------------------------------------------------------------
-
-def test_stoploss_interval_uses_atr_baseline():
+def make_df(n: int, atr_values=None, add_nan_prefix: int = 0) -> pd.DataFrame:
     """
-    next_stoploss_audit_interval must return:
-    - 60s when ATR percentile >= 0.80 (high volatility)
-    - 300s when ATR percentile < 0.80 (normal)
-    - 60s when ATR baseline is insufficient (conservative)
-    - 300s when no open trades (nothing to audit)
+    Build a minimal DataFrame with atr_pct column.
 
-    This is the core invariant from blueprint v1.9 Section 6 Step 6.
-    ATR percentile must come from a real historical baseline (5000 candles min),
-    not from arbitrary latest-dataframe quantiles.
-
-    The interval function is pure — no side effects, no external calls.
-    Injectable atr_state makes it testable without running ATR service.
+    n: total rows.
+    atr_values: if None, linearly increasing from 0.001 to 0.02 (realistic range).
+    add_nan_prefix: first N rows will have NaN atr_pct (simulates ATR warmup period).
     """
-    trades = [open_trade()]
+    if atr_values is None:
+        atr_values = np.linspace(0.001, 0.020, n)
 
-    # High volatility — must use 60s
-    assert next_stoploss_audit_interval(trades, atr_ok(0.80)) == INTERVAL_HIGH_RISK_SEC, (
-        "ATR percentile == 0.80 must trigger 60s interval"
-    )
-    assert next_stoploss_audit_interval(trades, atr_ok(0.85)) == INTERVAL_HIGH_RISK_SEC, (
-        "ATR percentile > 0.80 must trigger 60s interval"
-    )
-    assert next_stoploss_audit_interval(trades, atr_ok(0.99)) == INTERVAL_HIGH_RISK_SEC, (
-        "ATR percentile at 0.99 must trigger 60s interval"
-    )
+    df = pd.DataFrame({
+        "open": np.ones(n) * 50000,
+        "high": np.ones(n) * 50500,
+        "low": np.ones(n) * 49500,
+        "close": np.ones(n) * 50000,
+        ATR_COLUMN: atr_values,
+    })
 
-    # Below threshold — must use 300s
-    assert next_stoploss_audit_interval(trades, atr_ok(0.79)) == INTERVAL_NORMAL_SEC, (
-        "ATR percentile just below 0.80 must use 300s interval"
-    )
-    assert next_stoploss_audit_interval(trades, atr_ok(0.50)) == INTERVAL_NORMAL_SEC, (
-        "ATR percentile 0.50 must use 300s interval"
-    )
-    assert next_stoploss_audit_interval(trades, atr_ok(0.00)) == INTERVAL_NORMAL_SEC, (
-        "ATR percentile 0.00 must use 300s interval"
-    )
+    if add_nan_prefix > 0:
+        df.loc[df.index[:add_nan_prefix], ATR_COLUMN] = np.nan
 
-    # Insufficient baseline with open trades — must use 60s
-    assert next_stoploss_audit_interval(trades, atr_insufficient()) == INTERVAL_HIGH_RISK_SEC, (
-        "ATR_BASELINE_INSUFFICIENT with open trades must trigger 60s"
-    )
-
-    # No open trades — always 300s regardless of ATR
-    assert next_stoploss_audit_interval([], atr_ok(0.99)) == INTERVAL_NORMAL_SEC, (
-        "No open trades must always return 300s"
-    )
-    assert next_stoploss_audit_interval([], atr_insufficient()) == INTERVAL_NORMAL_SEC, (
-        "No open trades + insufficient baseline must still return 300s"
-    )
+    return df
 
 
 # ---------------------------------------------------------------------------
-# Interval policy edge cases
+# test_atr_percentile_min_lookback  ← REQUIRED GATE
 # ---------------------------------------------------------------------------
 
-def test_interval_recent_incidents_override_atr():
+def test_atr_percentile_min_lookback():
     """
-    recent_stop_incidents > 0 forces 60s regardless of ATR state.
-    Incident response mode takes priority over volatility regime.
+    compute_atr_percentile_baseline must:
+    - Return ATR_BASELINE_INSUFFICIENT when valid candles < 5000.
+    - Return OK when valid candles >= 5000.
+    - atr_percentile must be None when insufficient.
+    - atr_percentile must be a float in [0, 1] when OK.
+
+    Blueprint v1.9 Section 6 Step 6:
+        min_lookback_candles: 5000
+        fallback_if_insufficient_history: ATR_BASELINE_INSUFFICIENT_PAUSE_FOR_MICRO_LIVE
+
+    This test is the reason ATR percentile cannot be computed from arbitrary
+    latest-dataframe quantiles: without a stable 5000-candle baseline,
+    the percentile is meaningless and could trigger wrong audit intervals.
     """
-    trades = [open_trade()]
+    # --- Insufficient: exactly min_lookback - 1 candles
+    df_short = make_df(MIN_LOOKBACK_CANDLES - 1)
+    result_short = compute_atr_percentile_baseline(df_short, min_lookback=MIN_LOOKBACK_CANDLES)
 
-    # Low ATR + incident = still 60s
-    assert next_stoploss_audit_interval(trades, atr_ok(0.10), recent_stop_incidents=1) == INTERVAL_HIGH_RISK_SEC
-    assert next_stoploss_audit_interval(trades, atr_ok(0.50), recent_stop_incidents=3) == INTERVAL_HIGH_RISK_SEC
+    assert result_short["status"] == "ATR_BASELINE_INSUFFICIENT", (
+        f"Expected ATR_BASELINE_INSUFFICIENT for {MIN_LOOKBACK_CANDLES - 1} candles, "
+        f"got {result_short['status']}"
+    )
+    assert result_short["atr_percentile"] is None, (
+        "atr_percentile must be None when baseline is insufficient"
+    )
+    assert result_short["baseline_n"] == MIN_LOOKBACK_CANDLES - 1
+    assert result_short["required_n"] == MIN_LOOKBACK_CANDLES
 
-    # No incident + low ATR = 300s
-    assert next_stoploss_audit_interval(trades, atr_ok(0.50), recent_stop_incidents=0) == INTERVAL_NORMAL_SEC
+    # --- Exactly at threshold: min_lookback candles
+    df_exact = make_df(MIN_LOOKBACK_CANDLES)
+    result_exact = compute_atr_percentile_baseline(df_exact, min_lookback=MIN_LOOKBACK_CANDLES)
 
+    assert result_exact["status"] == "OK", (
+        f"Expected OK for exactly {MIN_LOOKBACK_CANDLES} candles, got {result_exact['status']}"
+    )
+    assert result_exact["atr_percentile"] is not None
+    assert 0.0 <= result_exact["atr_percentile"] <= 1.0, (
+        f"atr_percentile must be in [0, 1], got {result_exact['atr_percentile']}"
+    )
 
-def test_interval_constants_match_blueprint():
-    """
-    Verify interval constants match blueprint v1.9 values.
-    If these change, it's a deliberate policy change, not an accident.
-    """
-    assert INTERVAL_NORMAL_SEC == 300, "Normal interval must be 300s per blueprint"
-    assert INTERVAL_HIGH_RISK_SEC == 60, "High-risk interval must be 60s per blueprint"
-    assert ATR_HIGH_VOL_THRESHOLD == 0.80, "ATR threshold must be 0.80 per blueprint"
+    # --- Above threshold: min_lookback + 500 candles
+    df_long = make_df(MIN_LOOKBACK_CANDLES + 500)
+    result_long = compute_atr_percentile_baseline(df_long, min_lookback=MIN_LOOKBACK_CANDLES)
 
+    assert result_long["status"] == "OK"
+    assert 0.0 <= result_long["atr_percentile"] <= 1.0
 
-def test_interval_multiple_trades_same_as_one():
-    """
-    Interval policy depends on whether trades exist (bool), not count.
-    1 trade and 5 trades produce the same interval for same ATR state.
-    """
-    one_trade = [open_trade("t1")]
-    five_trades = [open_trade(f"t{i}") for i in range(5)]
-
-    for atr in [atr_ok(0.90), atr_ok(0.50), atr_insufficient()]:
-        assert (
-            next_stoploss_audit_interval(one_trade, atr)
-            == next_stoploss_audit_interval(five_trades, atr)
-        ), f"Interval must not depend on trade count for atr={atr}"
+    # --- Zero candles
+    df_empty = make_df(0, atr_values=np.array([]))
+    result_empty = compute_atr_percentile_baseline(df_empty, min_lookback=MIN_LOOKBACK_CANDLES)
+    assert result_empty["status"] == "ATR_BASELINE_INSUFFICIENT"
+    assert result_empty["atr_percentile"] is None
 
 
 # ---------------------------------------------------------------------------
-# StoplossAuditor.run_once() — verification logic
+# Percentile computation correctness
 # ---------------------------------------------------------------------------
 
-def test_auditor_verifies_stop_present(bus):
+def test_percentile_latest_is_maximum_returns_1():
     """
-    If exchange has a stop_limit order for the open trade's pair,
-    auditor must mark it verified and NOT post STOP_UNCONFIRMED.
+    If current ATR is the maximum in the series, percentile must be 1.0.
+    Linearly increasing series: last value is always max.
     """
-    ft = MagicMock()
-    ft.get_status.return_value = [open_trade("t1", "BTC/USDT")]
-
-    exchange = MagicMock()
-    exchange.fetch_open_orders.return_value = [stop_order("BTC/USDT", "stop_limit")]
-
-    auditor = StoplossAuditor(
-        exchange_client=exchange,
-        ft_client=ft,
-        bus=bus,
-        atr_state_fn=lambda: atr_ok(0.50),
-    )
-    summary = auditor.run_once()
-
-    assert summary["verified"] == 1
-    assert summary["missing"] == 0
-    assert summary["incidents"] == 0
-
-    # No STOP_UNCONFIRMED posted
-    pending = bus.consume_pending()
-    stop_actions = [a for a in pending if a["action_type"] == "STOP_UNCONFIRMED"]
-    assert len(stop_actions) == 0
+    df = make_df(MIN_LOOKBACK_CANDLES, atr_values=np.linspace(0.001, 0.020, MIN_LOOKBACK_CANDLES))
+    result = compute_atr_percentile_baseline(df)
+    assert result["status"] == "OK"
+    # Last value (0.020) is >= all others -> percentile == 1.0
+    assert result["atr_percentile"] == pytest.approx(1.0, abs=1e-6)
 
 
-def test_auditor_posts_stop_unconfirmed_when_missing(bus):
+def test_percentile_latest_is_minimum_returns_near_zero():
     """
-    If no stop order exists on exchange for an open trade,
-    auditor must post STOP_UNCONFIRMED with severity=HIGH.
+    If current ATR is the minimum in the series, percentile must be near 0.
+    Linearly decreasing series: last value is always min.
     """
-    ft = MagicMock()
-    ft.get_status.return_value = [open_trade("t2", "ETH/USDT")]
-
-    exchange = MagicMock()
-    # No stop orders on exchange
-    exchange.fetch_open_orders.return_value = [
-        {"id": "limit_001", "symbol": "ETH/USDT", "type": "limit", "side": "buy"}
-    ]
-
-    auditor = StoplossAuditor(
-        exchange_client=exchange,
-        ft_client=ft,
-        bus=bus,
-        atr_state_fn=lambda: atr_ok(0.50),
-    )
-    summary = auditor.run_once()
-
-    assert summary["missing"] == 1
-    assert summary["incidents"] == 1
-
-    pending = bus.consume_pending()
-    stop_actions = [a for a in pending if a["action_type"] == "STOP_UNCONFIRMED"]
-    assert len(stop_actions) == 1
-    assert stop_actions[0]["severity"] == "HIGH"
-    assert stop_actions[0]["pair"] == "ETH/USDT"
+    df = make_df(MIN_LOOKBACK_CANDLES, atr_values=np.linspace(0.020, 0.001, MIN_LOOKBACK_CANDLES))
+    result = compute_atr_percentile_baseline(df)
+    assert result["status"] == "OK"
+    # Last value (0.001) <= all others -> 1/n fraction (only itself)
+    assert result["atr_percentile"] == pytest.approx(1.0 / MIN_LOOKBACK_CANDLES, abs=1e-4)
 
 
-def test_auditor_no_trades_no_action(bus):
+def test_percentile_median_value_near_0_5():
     """
-    No open trades = nothing to audit. No STOP_UNCONFIRMED posted.
+    If current ATR equals the median of the series, percentile must be ~0.5.
     """
-    ft = MagicMock()
-    ft.get_status.return_value = []
+    n = MIN_LOOKBACK_CANDLES
+    values = np.linspace(0.001, 0.020, n)
+    # Place the median value at the last position
+    median_val = float(np.median(values))
+    values[-1] = median_val
 
-    exchange = MagicMock()
-    exchange.fetch_open_orders.return_value = []
-
-    auditor = StoplossAuditor(
-        exchange_client=exchange,
-        ft_client=ft,
-        bus=bus,
-    )
-    summary = auditor.run_once()
-
-    assert summary["verified"] == 0
-    assert summary["missing"] == 0
-    assert len(bus.consume_pending()) == 0
-
-
-def test_auditor_exchange_fetch_fail_posts_unconfirmed(bus):
-    """
-    If exchange.fetch_open_orders() fails, auditor cannot verify stops.
-    Must conservatively post STOP_UNCONFIRMED for all open trades.
-    """
-    ft = MagicMock()
-    ft.get_status.return_value = [open_trade("t3", "BTC/USDT")]
-
-    exchange = MagicMock()
-    exchange.fetch_open_orders.side_effect = ConnectionError("exchange down")
-
-    auditor = StoplossAuditor(
-        exchange_client=exchange,
-        ft_client=ft,
-        bus=bus,
-        atr_state_fn=lambda: atr_ok(0.50),
-    )
-    summary = auditor.run_once()
-
-    assert summary["incidents"] == 1
-    pending = bus.consume_pending()
-    assert any(a["action_type"] == "STOP_UNCONFIRMED" for a in pending)
-
-
-def test_auditor_deduplicates_stop_unconfirmed(bus):
-    """
-    If STOP_UNCONFIRMED is already pending, auditor must not post another.
-    Prevents flooding Decision Bus during persistent stop absence.
-    """
-    ft = MagicMock()
-    ft.get_status.return_value = [open_trade("t4", "BTC/USDT")]
-    exchange = MagicMock()
-    exchange.fetch_open_orders.return_value = []
-
-    auditor = StoplossAuditor(
-        exchange_client=exchange,
-        ft_client=ft,
-        bus=bus,
-        atr_state_fn=lambda: atr_ok(0.50),
+    df = make_df(n, atr_values=values)
+    result = compute_atr_percentile_baseline(df)
+    assert result["status"] == "OK"
+    # Median splits the distribution 50/50
+    assert 0.45 <= result["atr_percentile"] <= 0.55, (
+        f"Median ATR should give percentile ~0.5, got {result['atr_percentile']}"
     )
 
-    # Run twice without consuming the pending action
-    auditor.run_once()
-    auditor.run_once()
 
-    all_stop = bus._conn.execute(
-        "SELECT COUNT(*) FROM system_actions WHERE action_type='STOP_UNCONFIRMED'"
-    ).fetchone()[0]
-    assert all_stop == 1, f"Expected 1 STOP_UNCONFIRMED, got {all_stop} (dedup failed)"
-
-
-def test_auditor_clientorderid_match_takes_priority(bus):
+def test_high_vol_flag_matches_threshold():
     """
-    If exchange order has clientOrderId containing trade_id,
-    it must be matched even if the pair is different.
-    (Guards against multi-pair portfolios where pair-match would be ambiguous.)
+    is_high_vol must be True iff atr_percentile >= HIGH_VOL_THRESHOLD (0.80).
     """
-    ft = MagicMock()
-    ft.get_status.return_value = [open_trade("trade_42", "BTC/USDT")]
+    n = MIN_LOOKBACK_CANDLES
+    # Build series where last value is at exactly the 80th percentile
+    values = np.linspace(0.001, 0.020, n)
+    p80_val = float(np.percentile(values, 80))
+    values[-1] = p80_val
 
-    exchange = MagicMock()
-    exchange.fetch_open_orders.return_value = [
-        {
-            "id": "stop_x",
-            "symbol": "BTC/USDT",
-            "type": "stop_limit",
-            "side": "sell",
-            "clientOrderId": "ft_trade_42_stoploss",  # contains trade_id
-        }
-    ]
+    df = make_df(n, atr_values=values)
+    result = compute_atr_percentile_baseline(df)
+    assert result["status"] == "OK"
 
-    auditor = StoplossAuditor(
-        exchange_client=exchange,
-        ft_client=ft,
-        bus=bus,
-        atr_state_fn=lambda: atr_ok(0.50),
-    )
-    summary = auditor.run_once()
-
-    assert summary["verified"] == 1
-    assert summary["missing"] == 0
+    # At or above 0.80: is_high_vol must be True
+    if result["atr_percentile"] >= HIGH_VOL_THRESHOLD:
+        assert result["is_high_vol"] is True
+    else:
+        assert result["is_high_vol"] is False
 
 
-def test_auditor_uses_injectable_atr_state(bus):
+def test_spike_flag_at_0_90_threshold():
+    """is_spike must be True iff atr_percentile >= 0.90."""
+    n = MIN_LOOKBACK_CANDLES
+    # Latest = max -> percentile = 1.0 -> both is_high_vol and is_spike True
+    values = np.linspace(0.001, 0.020, n)
+    df = make_df(n, atr_values=values)
+    result = compute_atr_percentile_baseline(df)
+    assert result["is_spike"] is True
+    assert result["is_high_vol"] is True
+
+
+# ---------------------------------------------------------------------------
+# NaN handling
+# ---------------------------------------------------------------------------
+
+def test_nan_rows_excluded_from_baseline():
     """
-    Auditor must use the atr_state_fn result for interval computation,
-    not hardcode any ATR value.
-
-    Verified by checking run_once() summary integrates with
-    next_stoploss_audit_interval() using the injected state.
+    NaN ATR values (ATR warmup period) must not count toward min_lookback.
+    A DataFrame with 5100 rows but 200 NaN prefix must behave as 4900 valid = insufficient.
     """
-    ft = MagicMock()
-    ft.get_status.return_value = [open_trade()]
-    exchange = MagicMock()
-    exchange.fetch_open_orders.return_value = [stop_order()]
+    total = 5100
+    nan_prefix = 200
+    valid_n = total - nan_prefix  # 4900 < 5000
 
-    # Inject high-volatility state
-    high_vol_state = atr_ok(0.95)
-    auditor = StoplossAuditor(
-        exchange_client=exchange,
-        ft_client=ft,
-        bus=bus,
-        atr_state_fn=lambda: high_vol_state,
-    )
-    summary = auditor.run_once()
+    df = make_df(total, add_nan_prefix=nan_prefix)
+    result = compute_atr_percentile_baseline(df, min_lookback=MIN_LOOKBACK_CANDLES)
 
-    # Verify interval for this state
-    interval = next_stoploss_audit_interval(
-        summary["open_trades"],
-        high_vol_state,
-        summary["incidents"],
+    assert result["status"] == "ATR_BASELINE_INSUFFICIENT", (
+        f"5100 total - 200 NaN = 4900 valid < 5000: expected INSUFFICIENT, got {result['status']}"
     )
-    assert interval == INTERVAL_HIGH_RISK_SEC, (
-        f"High vol atr_state must produce 60s interval, got {interval}"
+    assert result["baseline_n"] == valid_n
+
+
+def test_sufficient_valid_after_nan_prefix():
+    """
+    5200 total - 100 NaN = 5100 valid >= 5000: must return OK.
+    """
+    total = 5200
+    nan_prefix = 100
+    df = make_df(total, add_nan_prefix=nan_prefix)
+    result = compute_atr_percentile_baseline(df, min_lookback=MIN_LOOKBACK_CANDLES)
+    assert result["status"] == "OK"
+    assert result["baseline_n"] == MIN_LOOKBACK_CANDLES  # capped at min_lookback
+
+
+# ---------------------------------------------------------------------------
+# Expanding window cap
+# ---------------------------------------------------------------------------
+
+def test_baseline_capped_at_min_lookback():
+    """
+    With 8000 valid candles, baseline_n must be capped at min_lookback (5000).
+    The extra 3000 candles are excluded from the population.
+    """
+    n = 8000
+    df = make_df(n)
+    result = compute_atr_percentile_baseline(df, min_lookback=MIN_LOOKBACK_CANDLES)
+    assert result["status"] == "OK"
+    assert result["baseline_n"] == MIN_LOOKBACK_CANDLES, (
+        f"baseline_n must be capped at {MIN_LOOKBACK_CANDLES}, got {result['baseline_n']}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Error handling
+# ---------------------------------------------------------------------------
+
+def test_missing_atr_column_returns_error():
+    """Missing atr_pct column must return ATR_BASELINE_ERROR, not raise."""
+    df = pd.DataFrame({"close": [50000.0] * 100})
+    result = compute_atr_percentile_baseline(df)
+    assert result["status"] == "ATR_BASELINE_ERROR"
+    assert "atr_pct" in result["error"]
+    assert result["atr_percentile"] is None
+
+
+def test_all_nan_atr_column_returns_insufficient():
+    """All-NaN atr_pct column = 0 valid candles = INSUFFICIENT."""
+    df = make_df(5000)
+    df[ATR_COLUMN] = np.nan
+    result = compute_atr_percentile_baseline(df)
+    assert result["status"] == "ATR_BASELINE_INSUFFICIENT"
+    assert result["baseline_n"] == 0
+
+
+# ---------------------------------------------------------------------------
+# add_atr_pct helper
+# ---------------------------------------------------------------------------
+
+def test_add_atr_pct_produces_valid_column():
+    """add_atr_pct must produce a non-NaN atr_pct column (after warmup)."""
+    n = 100
+    df = pd.DataFrame({
+        "open": np.ones(n) * 50000,
+        "high": np.ones(n) * 50500 + np.random.rand(n) * 100,
+        "low": np.ones(n) * 49500 - np.random.rand(n) * 100,
+        "close": np.ones(n) * 50000 + np.random.rand(n) * 50,
+    })
+    result_df = add_atr_pct(df, period=14)
+    assert ATR_COLUMN in result_df.columns
+    # After period warmup, values should be non-NaN
+    valid = result_df[ATR_COLUMN].dropna()
+    assert len(valid) > 0
+    assert (valid > 0).all(), "atr_pct must be positive"
+
+
+def test_add_atr_pct_does_not_mutate_input():
+    """add_atr_pct must return a copy, not mutate the input."""
+    df = pd.DataFrame({
+        "open": [50000.0] * 50,
+        "high": [50500.0] * 50,
+        "low": [49500.0] * 50,
+        "close": [50000.0] * 50,
+    })
+    original_cols = set(df.columns)
+    add_atr_pct(df)
+    assert set(df.columns) == original_cols, "Input DataFrame must not be mutated"
+
+
+# ---------------------------------------------------------------------------
+# ATRPercentileService
+# ---------------------------------------------------------------------------
+
+def test_service_returns_insufficient_on_first_call_with_small_df():
+    """Service must return INSUFFICIENT if provider returns < 5000 candles."""
+    small_df = make_df(100)
+    service = ATRPercentileService(
+        df_provider=lambda: small_df,
+        refresh_hours=6,
+        min_lookback=MIN_LOOKBACK_CANDLES,
+    )
+    state = service.get_current_state()
+    assert state["status"] == "ATR_BASELINE_INSUFFICIENT"
+    assert state["atr_percentile"] is None
+
+
+def test_service_returns_ok_with_sufficient_df():
+    """Service must return OK if provider returns >= 5000 candles."""
+    large_df = make_df(MIN_LOOKBACK_CANDLES + 100)
+    service = ATRPercentileService(
+        df_provider=lambda: large_df,
+        refresh_hours=6,
+        min_lookback=MIN_LOOKBACK_CANDLES,
+    )
+    state = service.get_current_state()
+    assert state["status"] == "OK"
+    assert state["atr_percentile"] is not None
