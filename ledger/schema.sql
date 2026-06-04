@@ -133,3 +133,13 @@ CREATE INDEX IF NOT EXISTS idx_reserved_funds_status
 
 CREATE INDEX IF NOT EXISTS idx_strategy_memory_stage
     ON strategy_memory (stage_gate, created_ts);
+
+CREATE TABLE IF NOT EXISTS regime_log (
+    log_id       TEXT PRIMARY KEY,
+    pair         TEXT NOT NULL,
+    regime       TEXT NOT NULL,
+    multiplier   REAL NOT NULL,
+    atr_pct      REAL,
+    dm_ratio     REAL,
+    created_ts   TEXT NOT NULL
+);
