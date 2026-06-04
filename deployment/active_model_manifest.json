@@ -1,0 +1,15 @@
+{
+  "strategy_id": "retail_edge_v1",
+  "model_id": "bucket_baseline_dry_run_001",
+  "model_type": "bucket_baseline",
+  "model_hash": "sha256:DRY_RUN_PLACEHOLDER",
+  "feature_hash": "sha256:DRY_RUN_PLACEHOLDER",
+  "cost_model_hash": "sha256:DRY_RUN_PLACEHOLDER",
+  "regime_policy_hash": "sha256:DRY_RUN_PLACEHOLDER",
+  "venue_key": "binance_spot_usdt",
+  "approved_by": "operator",
+  "approved_at": "2026-06-04T07:00:00Z",
+  "promotion_source": "manual",
+  "rollback_model_id": null,
+  "challenger_live": false
+}
