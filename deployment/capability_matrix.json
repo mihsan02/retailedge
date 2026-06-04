@@ -1,0 +1,18 @@
+{
+  "binance_spot": {
+    "freqtrade_min_version": "2026.1",
+    "trading_mode": "spot",
+    "maker_first_supported": true,
+    "post_only_supported": true,
+    "market_order_supported": true,
+    "limit_order_supported": true,
+    "stoploss_on_exchange_supported": true,
+    "stoploss_order_types_supported": ["stop_limit"],
+    "stoploss_api_versions_supported": ["spot_stop_order_v1"],
+    "conditional_order_mode_supported": ["native_spot_stop_limit"],
+    "time_in_force_supported": ["GTC"],
+    "min_notional_source": "exchange_markets",
+    "rate_limit_policy": "ccxt_enableRateLimit_true",
+    "reduce_only_supported": false
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "binance_spot_usdt": {
+    "exchange_key": "binance_spot",
+    "maker_fee_pct": 0.0010,
+    "taker_fee_pct": 0.0010,
+    "maker_first": true,
+    "post_only_supported": true,
+    "stoploss_on_exchange_supported": true,
+    "stoploss_order_type": "stop_limit",
+    "stoploss_api_version": "spot_stop_order_v1",
+    "conditional_order_mode": "native_spot_stop_limit",
+    "cost_floor_pct": 0.0046,
+    "emergency_exit_enabled": false,
+    "emergency_exit_price_distance_pct": 0.005,
+    "stoploss_audit_interval_normal_sec": 300,
+    "stoploss_audit_interval_high_risk_sec": 60
+  }
+}
