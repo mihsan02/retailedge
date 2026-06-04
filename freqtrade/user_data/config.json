@@ -37,11 +37,15 @@
     "secret": "",
     "ccxt_config": {},
     "ccxt_async_config": {},
-    "pair_whitelist": ["BTC/USDT"],
+    "pair_whitelist": [
+      "BTC/USDT"
+    ],
     "pair_blacklist": []
   },
   "pairlists": [
-    {"method": "StaticPairList"}
+    {
+      "method": "StaticPairList"
+    }
   ],
   "api_server": {
     "enabled": true,
@@ -49,10 +53,10 @@
     "listen_port": 8080,
     "verbosity": "error",
     "enable_openapi": false,
-    "jwt_secret_key": "changeme_generate_random_32char_string",
+    "jwt_secret_key": "7924ad16cc340c3de2808f07a57e3aee3e7a3d9a38c15c025b31da608e6e1caf",
     "CORS_origins": [],
     "username": "retailedge",
-    "password": "changeme_before_live"
+    "password": "retailedge123"
   },
   "bot_name": "RetailEdge",
   "initial_state": "running",
