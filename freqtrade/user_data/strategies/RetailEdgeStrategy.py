@@ -53,6 +53,97 @@ STRATEGY_MEMORY_STAGE = "REAL_DATA_OOS"
 ATR_MIN_LOOKBACK = 1000
 ATR_HIGH_VOLATILITY_THRESHOLD = 0.80  # CLAUDE.md Hard Constraint #6
 
+# ---------------------------------------------------------------------------
+# Pre-Trade Gate constants — keep in sync with sidecar/reconciler/pre_trade_gate.py
+# ---------------------------------------------------------------------------
+BALANCE_BUFFER = 1.05        # projected_available must be >= stake * 1.05
+DEFAULT_MIN_NOTIONAL = 10.0  # Binance Spot minimum order size (USDT)
+
+# ---------------------------------------------------------------------------
+# Pre-Trade Gate — module-level functions (testable without Freqtrade instance)
+# NOTE: Keep in sync with sidecar/reconciler/pre_trade_gate.py manually.
+# ---------------------------------------------------------------------------
+
+def _inline_pre_entry_balance_check(
+    pair: str,
+    proposed_stake: float,
+    wallet_available: float,
+    reserved_total: float,
+    min_notional: float = DEFAULT_MIN_NOTIONAL,
+) -> bool:
+    """
+    Pure function. Returns True if entry is safe to proceed.
+
+    Rules (in order):
+    1. proposed_stake == 0 -> block
+    2. proposed_stake < min_notional -> block
+    3. projected_available = wallet_available - reserved_total
+       projected_available < proposed_stake * BALANCE_BUFFER -> block
+    4. else -> pass
+    """
+    if proposed_stake <= 0.0:
+        logger.info("%s: stake=0 -> block", pair)
+        return False
+
+    if proposed_stake < min_notional:
+        logger.info(
+            "%s: stake=%.4f below min_notional=%.4f -> block",
+            pair, proposed_stake, min_notional,
+        )
+        return False
+
+    projected_available = wallet_available - reserved_total
+    required = proposed_stake * BALANCE_BUFFER
+
+    if projected_available < required:
+        logger.info(
+            "%s: projected_available=%.4f < required=%.4f -> block",
+            pair, projected_available, required,
+        )
+        return False
+
+    return True
+
+
+def _read_wallet_state(db_path: str | None = None) -> tuple[float, float]:
+    """
+    Read wallet_available and reserved_total from ledger.
+
+    Returns:
+        (wallet_available, reserved_total)
+
+    Dry-run sentinel: wallet_available=999999.0 when no live balance available.
+    reserved_total is always summed from reserved_funds table.
+    Returns (999999.0, 0.0) if ledger unavailable.
+    """
+    if db_path is None:
+        db_path = os.environ.get("LEDGER_DB_PATH", "ledger/retailedge.db")
+
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(f"Ledger DB not found: {db_path}")
+
+    try:
+        with sqlite3.connect(db_path, timeout=3.0) as conn:
+            tables = {
+                r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+
+            if "reserved_funds" not in tables:
+                return 999999.0, 0.0
+
+            row = conn.execute(
+                "SELECT COALESCE(SUM(reserved_quote), 0.0) FROM reserved_funds"
+            ).fetchone()
+            reserved_total = float(row[0]) if row else 0.0
+
+    except sqlite3.Error as e:
+        raise RuntimeError(f"Ledger read failed: {e}") from e
+
+    return 999999.0, reserved_total
+
+
 
 # ---------------------------------------------------------------------------
 # Ledger helpers — inline, no sidecar import
@@ -363,6 +454,27 @@ class RetailEdgeStrategy(IStrategy):
         regime_multiplier = self._get_regime_multiplier(pair)
         if regime_multiplier == 0.0:
             logger.info("%s: regime_multiplier=0.0, blocking entry", pair)
+            return False
+
+        # Balance gate — read reserved funds from ledger, check projected available
+        try:
+            wallet_available, reserved_total = _read_wallet_state()
+        except Exception as exc:
+            logger.warning(
+                "%s: _read_wallet_state failed (%s), blocking entry", pair, exc
+            )
+            return False
+
+        min_notional = float(os.environ.get("MIN_NOTIONAL_USDT", DEFAULT_MIN_NOTIONAL))
+        proposed_stake = amount * rate
+
+        if not _inline_pre_entry_balance_check(
+            pair=pair,
+            proposed_stake=proposed_stake,
+            wallet_available=wallet_available,
+            reserved_total=reserved_total,
+            min_notional=min_notional,
+        ):
             return False
 
         return True

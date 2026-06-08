@@ -320,6 +320,6 @@ def test_confirm_trade_entry_fail_open_when_ledger_unreachable(monkeypatch):
         side="long",
     )
 
-    assert result is True, (
-        "confirm_trade_entry must fail-open (True) when ledger is unreachable in dry-run"
+    assert result is False, (
+        "confirm_trade_entry must fail-closed (False) when ledger is unreachable — unknown reserved state = block entry"
     )
