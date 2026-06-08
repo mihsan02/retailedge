@@ -25,3 +25,4 @@ freqtrade/user_data/config.generated.json
 freqtrade/user_data/tradesv3.sqlite-shm
 freqtrade/user_data/tradesv3.sqlite-wal
 tests/test_emergency_exit_drill.py
+freqtrade/user_data/config.json
