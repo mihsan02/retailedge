@@ -83,22 +83,17 @@ CREATE TABLE IF NOT EXISTS trade_state_flags (
 
 -- 7. Strategy candidate evidence store
 CREATE TABLE IF NOT EXISTS strategy_memory (
-    candidate_id TEXT PRIMARY KEY,
-    strategy_id TEXT NOT NULL,
-    model_type TEXT NOT NULL,
-    model_hash TEXT,
-    feature_hash TEXT,
-    oos_trades INTEGER,
-    oos_expectancy REAL,
-    oos_sharpe REAL,
-    pbo REAL,
-    dsr REAL,
-    cost_floor_pct REAL,
-    stage_gate TEXT NOT NULL DEFAULT 'CANDIDATE',
-    approved_by TEXT,
-    approved_at TEXT,
-    created_ts TEXT NOT NULL,
-    updated_ts TEXT
+  candidate_id TEXT PRIMARY KEY,
+  strategy_id TEXT,
+  model_type TEXT,
+  stage TEXT,
+  oos_metrics TEXT,
+  pair TEXT,
+  data_source TEXT,
+  created_ts TEXT,
+  notes TEXT
+);
+
 );
 
 -- 8. Champion promotion history

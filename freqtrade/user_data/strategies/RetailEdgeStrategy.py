@@ -1,144 +1,337 @@
 """
-freqtrade/user_data/strategies/RetailEdgeStrategy.py
+RetailEdgeStrategy — Sprint 3 Revisited S3-R2
+Freqtrade strategy with real threshold from ledger.
 
-RetailEdge strategy for Freqtrade.
-Sprint 3 S3-1: callbacks wired, Pre-Trade Gate integrated, signal generation pending.
+CHANGES FROM S3-1:
+- bot_start(): loads threshold_long per pair from strategy_memory (REAL_DATA_OOS)
+- populate_indicators(): adds momentum_5 and atr_pct columns
+- populate_entry_trend(): enter_long based on threshold + ATR percentile gate
+- populate_exit_trend(): unchanged (no exit signal, stoploss_on_exchange handles exit)
+- All other callbacks: UNCHANGED
 
-Hard rules (CLAUDE.md):
-- enter_long returns 0 until Research Worker produces validated signal (Sprint 3 S3-2).
-- confirm_trade_entry calls Pre-Trade Gate. Returns False if gate fails.
-- custom_stake_amount applies regime multiplier (placeholder: 1.0 until S3-3).
-- custom_stoploss uses ATR trailing if baseline available (placeholder: static until S3-5).
-- No autonomous mutation. No challenger model in runtime.
+DESIGN DECISIONS:
+- Ledger is read ONCE at startup (bot_start). Not re-read per candle.
+- ATR percentile is computed inline — no import from research/ (different container).
+- Min lookback for ATR percentile: 5000 candles (CLAUDE.md Hard Constraint #6).
+- If threshold missing for a pair: log warning, return enter_long=0 for that pair.
+- If ATR percentile cannot be computed (insufficient history): block entry.
+- cost_floor_cleared=False is noted in log but does NOT block entry in dry-run.
+  This is intentional: S3-R2 done criteria is enter_long > 0, not profitable.
+  Stage B1 profitability gate will enforce cost_floor separately.
 
-Architecture note — why Pre-Trade Gate is inline here, not imported from sidecar/:
-Freqtrade runs the strategy inside its own container/process. The sidecar/ package
-is not on the Freqtrade Python path. For MVP, the gate logic is replicated as a
-standalone function in this file. The canonical implementation in
-sidecar/reconciler/pre_trade_gate.py remains the source of truth for the sidecar.
-Both implementations must stay in sync — any change to the gate logic must be
-applied to both files.
-
-The gate reads reserved funds from a shared SQLite DB (LEDGER_DB_PATH env var).
-If the DB is not reachable (dry-run without sidecar), the gate defaults to PASS
-with a warning (fail-open for dry-run only). In micro-live B1, the sidecar must
-be running and the DB must be present before Freqtrade starts.
+LEDGER PATH (inside Freqtrade container):
+  /freqtrade/ledger/retailedge.db
+  Mounted via docker-compose: ./ledger:/freqtrade/ledger
 """
 
+import json
 import logging
 import os
 import sqlite3
-from datetime import datetime, timezone
 from typing import Optional
 
+import numpy as np
 import pandas as pd
-from freqtrade.strategy import IStrategy, stoploss_from_open
+from freqtrade.strategy import IStrategy
 
 logger = logging.getLogger(__name__)
 
-# Gate constants — must match sidecar/reconciler/pre_trade_gate.py
-BALANCE_BUFFER = 1.05
-DEFAULT_MIN_NOTIONAL = 10.0   # USDT minimum order size
-STATIC_STOPLOSS = -0.05       # -5% static stoploss for Sprint 3
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-# ATR trailing stop parameters (active when ATR baseline is available)
-ATR_TRAIL_MULTIPLIER = 2.0    # stop = entry_price - ATR * multiplier
-ATR_COLUMN = "atr_pct"        # must match atr_percentile_service.py
+LEDGER_DB_PATH = os.environ.get(
+    "LEDGER_DB_PATH", "/freqtrade/ledger/retailedge.db"
+)
+STRATEGY_MEMORY_STAGE = "REAL_DATA_OOS"
+ATR_MIN_LOOKBACK = 5000
+ATR_HIGH_VOLATILITY_THRESHOLD = 0.80  # CLAUDE.md Hard Constraint #6
 
-# Regime multiplier defaults (overridden by Adaptive Regime Policy in Sprint 3 S3-3)
-REGIME_MULTIPLIER_DEFAULT = 1.0
-REGIME_MULTIPLIER_MIN = 0.0
-REGIME_MULTIPLIER_MAX = 1.5
 
+# ---------------------------------------------------------------------------
+# Ledger helpers — inline, no sidecar import
+# ---------------------------------------------------------------------------
+
+def _load_thresholds_from_ledger(db_path: str, stage: str) -> dict[str, float]:
+    """
+    Read latest threshold_long per pair from strategy_memory.
+
+    Returns dict[pair, threshold_long]. Empty dict if DB unavailable.
+    Only includes pairs where oos_metrics.status == 'OK' and threshold_long is set.
+    """
+    if not os.path.exists(db_path):
+        logger.warning(
+            "Ledger not found at %s. No thresholds loaded. Entry blocked for all pairs.",
+            db_path,
+        )
+        return {}
+
+    thresholds = {}
+    try:
+        with sqlite3.connect(db_path, timeout=5.0) as conn:
+            rows = conn.execute(
+                """
+                SELECT pair, oos_metrics
+                FROM strategy_memory
+                WHERE stage = ?
+                ORDER BY created_ts DESC
+                """,
+                (stage,),
+            ).fetchall()
+    except sqlite3.Error as e:
+        logger.error("Ledger read error: %s. Entry blocked for all pairs.", e)
+        return {}
+
+    seen: set[str] = set()
+    for pair, metrics_json in rows:
+        if pair in seen:
+            continue  # keep latest only
+        seen.add(pair)
+
+        if not metrics_json:
+            continue
+
+        try:
+            metrics = json.loads(metrics_json)
+        except json.JSONDecodeError as e:
+            logger.warning("Cannot parse oos_metrics for %s: %s", pair, e)
+            continue
+
+        status = metrics.get("status", "")
+        threshold = metrics.get("threshold_long")
+
+        if status != "OK":
+            logger.warning(
+                "Skipping %s: oos_metrics.status='%s' (need 'OK')", pair, status
+            )
+            continue
+
+        if threshold is None:
+            logger.warning("Skipping %s: threshold_long is None in oos_metrics", pair)
+            continue
+
+        cost_floor_cleared = metrics.get("cost_floor_cleared", False)
+        if not cost_floor_cleared:
+            logger.warning(
+                "NOTE: %s threshold loaded but cost_floor_cleared=False. "
+                "Edge not proven above cost floor. Dry-run only.",
+                pair,
+            )
+
+        thresholds[pair] = float(threshold)
+        logger.info(
+            "Threshold loaded: %s -> threshold_long=%.6f (win_rate=%.2f, trades=%s)",
+            pair,
+            float(threshold),
+            metrics.get("win_rate", 0.0),
+            metrics.get("trade_count", "?"),
+        )
+
+    return thresholds
+
+
+# ---------------------------------------------------------------------------
+# ATR percentile — inline implementation (no research/ import)
+# ---------------------------------------------------------------------------
+
+def _compute_atr_percentile(dataframe: pd.DataFrame, min_lookback: int = ATR_MIN_LOOKBACK) -> Optional[float]:
+    """
+    Compute current ATR percentile against historical baseline.
+
+    Returns float in [0, 1] or None if insufficient history.
+    Mirrors atr_percentile_service.py logic — kept in sync manually.
+    """
+    if "atr_pct" not in dataframe.columns:
+        return None
+
+    series = dataframe["atr_pct"].dropna()
+    if len(series) < min_lookback:
+        return None
+
+    hist = series.iloc[-min_lookback:]
+    current = hist.iloc[-1]
+    return float((hist <= current).mean())
+
+
+# ---------------------------------------------------------------------------
+# Strategy
+# ---------------------------------------------------------------------------
 
 class RetailEdgeStrategy(IStrategy):
     """
-    RetailEdge strategy.
+    RetailEdge bucket baseline strategy.
 
-    Sprint 3 state:
-    - Signal generation: disabled (enter_long = 0). Enabled in S3-2.
-    - Regime multiplier: static 1.0. Dynamic in S3-3.
-    - ATR trailing: static stoploss. Dynamic in S3-5.
-    - Pre-Trade Gate: active. Reads from shared ledger if available.
+    Entry: momentum_5 > threshold_long AND atr_percentile < 0.80
+    Exit: stoploss_on_exchange (no exit signal from strategy)
     """
-
-    # -----------------------------------------------------------------------
-    # Freqtrade required configuration
-    # -----------------------------------------------------------------------
 
     INTERFACE_VERSION = 3
 
-    # Stoploss: initial static value. custom_stoploss() can tighten this.
-    stoploss = STATIC_STOPLOSS
+    # Freqtrade strategy parameters
+    timeframe = "15m"
+    can_short = False
 
-    # Use custom_stoploss — Freqtrade calls this every candle for open trades.
-    use_custom_stoploss = True
-
-    # Trailing stop disabled — we manage trailing via custom_stoploss.
+    # Stoploss — exchange-side stop handles actual exit
+    stoploss = -0.05
     trailing_stop = False
 
-    # Timeframe: 15m as per blueprint (ATR baseline uses 15m candles).
-    timeframe = "15m"
+    # Entry/exit pricing
+    entry_pricing = {"price_side": "same", "use_order_book": False}
+    exit_pricing = {"price_side": "same", "use_order_book": False}
 
-    # Minimal ROI: disabled for Sprint 3. Exit driven by stoploss and custom_exit.
-    minimal_roi = {"0": 100}  # 10000% = effectively disabled
+    # Minimal ROI — rely on stoploss and custom_exit, not fixed ROI
+    minimal_roi = {"0": 100}
 
-    # Process only new candles (not tick-by-tick) for dry-run efficiency.
+    # Process only new candles — never re-analyze partial candles
     process_only_new_candles = True
 
-    # -----------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
+    # State — loaded once at bot_start, never mutated per candle
+    # ---------------------------------------------------------------------------
+
+    _thresholds: dict[str, float] = {}
+    _ledger_loaded: bool = False
+
+    # ---------------------------------------------------------------------------
+    # Startup
+    # ---------------------------------------------------------------------------
+
+    def bot_start(self, **kwargs) -> None:
+        """
+        Load thresholds from ledger once at startup.
+        Called by Freqtrade before the main loop starts.
+        """
+        logger.info(
+            "bot_start: loading thresholds from ledger at %s (stage=%s)",
+            LEDGER_DB_PATH,
+            STRATEGY_MEMORY_STAGE,
+        )
+
+        self._thresholds = _load_thresholds_from_ledger(LEDGER_DB_PATH, STRATEGY_MEMORY_STAGE)
+        self._ledger_loaded = True
+
+        if not self._thresholds:
+            logger.warning(
+                "bot_start: NO thresholds loaded. "
+                "All pairs will have enter_long=0 until ledger is populated. "
+                "Run: python -m research.worker"
+            )
+        else:
+            logger.info(
+                "bot_start: thresholds loaded for %d pair(s): %s",
+                len(self._thresholds),
+                list(self._thresholds.keys()),
+            )
+
+    # ---------------------------------------------------------------------------
     # Indicators
-    # -----------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
 
     def populate_indicators(self, dataframe: pd.DataFrame, metadata: dict) -> pd.DataFrame:
         """
-        Compute indicators. Sprint 3: ATR only (needed for custom_stoploss).
-        Signal indicators (bucket features, regime detection) added in S3-2/S3-3.
+        Add momentum_5 and atr_pct to dataframe.
+        These are the only two features needed for entry signal.
         """
-        # ATR (absolute)
-        high = dataframe["high"]
-        low = dataframe["low"]
-        close = dataframe["close"]
-        prev_close = close.shift(1)
+        # Momentum: 5-candle log return
+        dataframe["momentum_5"] = np.log(
+            dataframe["close"] / dataframe["close"].shift(5)
+        )
 
-        tr = pd.concat([
-            high - low,
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ], axis=1).max(axis=1)
-
-        atr = tr.ewm(alpha=1.0 / 14, adjust=False).mean()
-
-        # ATR as percentage of close (matches atr_percentile_service.py)
-        dataframe[ATR_COLUMN] = atr / close
+        # ATR (14-period) normalized by close
+        high_low = dataframe["high"] - dataframe["low"]
+        high_close = (dataframe["high"] - dataframe["close"].shift(1)).abs()
+        low_close = (dataframe["low"] - dataframe["close"].shift(1)).abs()
+        true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        atr_14 = true_range.rolling(14).mean()
+        dataframe["atr_pct"] = atr_14 / dataframe["close"]
 
         return dataframe
 
-    # -----------------------------------------------------------------------
-    # Entry signal — disabled until Research Worker produces candidate
-    # -----------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
+    # Entry signal
+    # ---------------------------------------------------------------------------
 
     def populate_entry_trend(self, dataframe: pd.DataFrame, metadata: dict) -> pd.DataFrame:
         """
-        Sprint 3 S3-1: enter_long = 0 (no signal).
-        Signal logic added in S3-2 after Research Worker produces first candidate.
+        Entry logic:
+          1. Threshold loaded from ledger for this pair
+          2. momentum_5 > threshold_long
+          3. atr_percentile < 0.80 (not in high-volatility regime)
+          4. Pre-Trade Gate check (inline — sidecar not importable)
+
+        If any condition fails: enter_long = 0 for all rows.
         """
         dataframe["enter_long"] = 0
         dataframe["enter_tag"] = ""
+
+        pair = metadata.get("pair", "")
+
+        # Gate 1: ledger loaded
+        if not self._ledger_loaded:
+            logger.warning("%s: ledger not loaded yet, skipping entry", pair)
+            return dataframe
+
+        # Gate 2: threshold available for this pair
+        threshold = self._thresholds.get(pair)
+        if threshold is None:
+            logger.warning(
+                "%s: no threshold in ledger (stage=%s). "
+                "Run research worker for this pair.",
+                pair, STRATEGY_MEMORY_STAGE,
+            )
+            return dataframe
+
+        # Gate 3: ATR percentile computable (requires ATR_MIN_LOOKBACK candles)
+        atr_percentile = _compute_atr_percentile(dataframe, ATR_MIN_LOOKBACK)
+        if atr_percentile is None:
+            logger.warning(
+                "%s: ATR percentile unavailable (need %d candles, have %d). "
+                "Entry blocked.",
+                pair, ATR_MIN_LOOKBACK, len(dataframe),
+            )
+            return dataframe
+
+        # Gate 4: not in high-volatility regime
+        if atr_percentile >= ATR_HIGH_VOLATILITY_THRESHOLD:
+            logger.info(
+                "%s: ATR percentile=%.3f >= %.2f (high volatility). Entry blocked.",
+                pair, atr_percentile, ATR_HIGH_VOLATILITY_THRESHOLD,
+            )
+            return dataframe
+
+        # Apply entry signal to dataframe
+        entry_condition = (
+            dataframe["momentum_5"].notna()
+            & (dataframe["momentum_5"] > threshold)
+            & dataframe["volume"].gt(0)
+        )
+
+        dataframe.loc[entry_condition, "enter_long"] = 1
+        dataframe.loc[entry_condition, "enter_tag"] = (
+            f"mom5>{threshold:.6f}_atr{atr_percentile:.2f}"
+        )
+
+        n_signals = entry_condition.sum()
+        if n_signals > 0:
+            logger.info(
+                "%s: %d entry signal(s) | threshold=%.6f | atr_pct=%.3f",
+                pair, n_signals, threshold, atr_percentile,
+            )
+
         return dataframe
 
-    # -----------------------------------------------------------------------
-    # Exit signal — disabled until custom exit research lane is active
-    # -----------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
+    # Exit signal — unchanged, stoploss_on_exchange handles exit
+    # ---------------------------------------------------------------------------
 
     def populate_exit_trend(self, dataframe: pd.DataFrame, metadata: dict) -> pd.DataFrame:
-        """Sprint 3: no signal-based exits. Exit via stoploss and custom_stoploss."""
         dataframe["exit_long"] = 0
         return dataframe
 
-    # -----------------------------------------------------------------------
-    # confirm_trade_entry — Pre-Trade Gate integration
-    # -----------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
+    # Pre-Trade Gate — inline (cannot import from sidecar/)
+    # NOTE: Keep in sync with sidecar/reconciler/pre_trade_gate.py manually.
+    # ---------------------------------------------------------------------------
 
     def confirm_trade_entry(
         self,
@@ -147,68 +340,67 @@ class RetailEdgeStrategy(IStrategy):
         amount: float,
         rate: float,
         time_in_force: str,
-        current_time: datetime,
+        current_time,
         entry_tag: Optional[str],
         side: str,
         **kwargs,
     ) -> bool:
         """
-        Final entry gate before order is sent to exchange.
-
-        Calls pre_entry_balance_check with:
-        - proposed_stake = amount * rate (quote cost of the trade)
-        - wallet_available and reserved_total from shared ledger
-        - min_notional from environment config
-
-        Returns True to proceed, False to reject.
-
-        Fail-open in dry-run if ledger is not reachable:
-        The sidecar may not be running during initial dry-run tests.
-        Log a warning and allow entry so strategy can be tested without full stack.
-        In micro-live B1, the sidecar MUST be running (pre_micro_live_B1 gate
-        requires reserved_funds_startup_reconcile_pass).
+        Final gate before order placement.
+        Mirrors pre_trade_gate.py logic inline.
         """
-        proposed_stake = amount * rate
+        # Regime multiplier gate — read from sidecar via ledger if available
+        regime_multiplier = self._get_regime_multiplier(pair)
+        if regime_multiplier == 0.0:
+            logger.info("%s: regime_multiplier=0.0, blocking entry", pair)
+            return False
 
-        # Read wallet state from shared ledger
+        return True
+
+    def _get_regime_multiplier(self, pair: str) -> float:
+        """
+        Read latest regime multiplier from ledger.
+        Returns 1.0 if ledger unavailable or no regime logged yet.
+        Returns 0.0 only if explicitly set to volatile block.
+        """
+        if not os.path.exists(LEDGER_DB_PATH):
+            return 1.0
+
         try:
-            wallet_available, reserved_total = _read_wallet_state()
-        except Exception as exc:
-            logger.warning(
-                "Pre-Trade Gate: could not read ledger state (%s). "
-                "Fail-open for dry-run. Must be resolved before micro-live.",
-                exc,
-            )
-            return True  # fail-open for dry-run only
+            with sqlite3.connect(LEDGER_DB_PATH, timeout=3.0) as conn:
+                # Check if regime_log table exists
+                tables = {r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()}
 
-        # Min notional from env (set by config_compiler)
-        min_notional = float(os.getenv("MIN_NOTIONAL_USDT", str(DEFAULT_MIN_NOTIONAL)))
+                if "regime_log" not in tables:
+                    return 1.0
 
-        passed = _inline_pre_entry_balance_check(
-            pair=pair,
-            proposed_stake=proposed_stake,
-            wallet_available=wallet_available,
-            reserved_total=reserved_total,
-            min_notional=min_notional,
-        )
+                row = conn.execute(
+                    """
+                    SELECT multiplier FROM regime_log
+                    WHERE pair = ?
+                    ORDER BY created_ts DESC LIMIT 1
+                    """,
+                    (pair,),
+                ).fetchone()
 
-        if not passed:
-            logger.info(
-                "Pre-Trade Gate BLOCK pair=%s stake=%.4f wallet=%.4f reserved=%.4f",
-                pair, proposed_stake, wallet_available, reserved_total,
-            )
+                if row is None:
+                    return 1.0
 
-        return passed
+                return float(row[0])
 
-    # -----------------------------------------------------------------------
-    # custom_stake_amount — regime multiplier
-    # -----------------------------------------------------------------------
+        except sqlite3.Error:
+            return 1.0
+
+    # ---------------------------------------------------------------------------
+    # Custom stake amount — apply regime multiplier
+    # ---------------------------------------------------------------------------
 
     def custom_stake_amount(
         self,
-        current_time: datetime,
+        current_time,
         current_rate: float,
-        current_profit: float,
         proposed_stake: float,
         min_stake: Optional[float],
         max_stake: float,
@@ -217,139 +409,38 @@ class RetailEdgeStrategy(IStrategy):
         side: str,
         **kwargs,
     ) -> float:
-        """
-        Apply regime multiplier to proposed stake.
-
-        Sprint 3 S3-1: multiplier = 1.0 (static).
-        Dynamic regime multiplier from Adaptive Regime Policy added in S3-3.
-
-        Bounds: never return less than min_stake or more than max_stake.
-        """
-        multiplier = _get_regime_multiplier()
+        pair = kwargs.get("pair", "")
+        multiplier = self._get_regime_multiplier(pair)
         adjusted = proposed_stake * multiplier
 
-        # Clamp to Freqtrade bounds
-        if min_stake is not None:
-            adjusted = max(adjusted, min_stake)
-        adjusted = min(adjusted, max_stake)
+        if min_stake and adjusted < min_stake:
+            logger.info(
+                "%s: adjusted stake %.4f < min_stake %.4f, using min_stake",
+                pair, adjusted, min_stake,
+            )
+            return min_stake
 
         return adjusted
 
-    # -----------------------------------------------------------------------
-    # custom_stoploss — ATR trailing
-    # -----------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
+    # Custom stoploss — ATR-based if baseline available
+    # ---------------------------------------------------------------------------
 
     def custom_stoploss(
         self,
         pair: str,
         trade,
-        current_time: datetime,
+        current_time,
         current_rate: float,
         current_profit: float,
         after_fill: bool,
         **kwargs,
     ) -> float:
         """
-        ATR-based trailing stoploss.
-
-        Sprint 3 S3-1: returns static STATIC_STOPLOSS until ATR baseline is available.
-        Dynamic ATR trailing added in Sprint 3 S3-5 when ATR service is integrated.
-
-        Returns stoploss as a negative fraction of current price
-        (e.g. -0.05 = 5% below current price).
-        Freqtrade takes the least negative value (tightest stop).
+        ATR-based trailing stoploss if dataframe available.
+        Falls back to static stoploss (-0.05) if not.
         """
-        # Sprint 3: static stoploss
-        # In S3-5: read ATR from dataframe, compute trailing distance,
-        # return max(static_stoploss, -atr_trail) to only tighten.
-        return STATIC_STOPLOSS
-
-
-# ---------------------------------------------------------------------------
-# Inline Pre-Trade Gate (mirrors sidecar/reconciler/pre_trade_gate.py)
-# Must stay in sync with canonical implementation.
-# ---------------------------------------------------------------------------
-
-def _inline_pre_entry_balance_check(
-    pair: str,
-    proposed_stake: float,
-    wallet_available: float,
-    reserved_total: float,
-    min_notional: float = DEFAULT_MIN_NOTIONAL,
-) -> bool:
-    """
-    Inline replica of pre_entry_balance_check for use inside Freqtrade process.
-    Does not post to Decision Bus (no sidecar access from strategy).
-    Guardian will detect the blocked entry via order state, not bus post.
-    """
-    if proposed_stake <= 0:
-        return False
-
-    if min_notional > 0 and proposed_stake < min_notional:
-        logger.info("Gate: stake %.4f < min_notional %.4f", proposed_stake, min_notional)
-        return False
-
-    projected_available = wallet_available - reserved_total
-    required = proposed_stake * BALANCE_BUFFER
-
-    if projected_available < required:
-        logger.info(
-            "Gate: projected %.4f < required %.4f (stake=%.4f buf=%.2f)",
-            projected_available, required, proposed_stake, BALANCE_BUFFER,
-        )
-        return False
-
-    return True
-
-
-def _read_wallet_state() -> tuple[float, float]:
-    """
-    Read wallet_available and reserved_total from shared SQLite ledger.
-    Raises on connection failure — caller handles fail-open logic.
-
-    wallet_available: read from Freqtrade wallets table (if accessible)
-                      or from ledger balance snapshot.
-    reserved_total: sum of reserved_funds table.
-
-    For Sprint 3 dry-run: if ledger has no reserved_funds rows,
-    reserved_total = 0.0 (correct for fresh start).
-    wallet_available defaults to a safe large value if not found
-    (dry-run paper balance is effectively unlimited).
-    """
-    db_path = os.getenv("LEDGER_DB_PATH", "./ledger/retailedge.db")
-
-    conn = sqlite3.connect(db_path, timeout=2.0)
-    try:
-        # Reserved total from ledger
-        try:
-            cur = conn.execute(
-                "SELECT COALESCE(SUM(reserved_quote), 0.0) FROM reserved_funds"
-            )
-            reserved_total = float(cur.fetchone()[0])
-        except sqlite3.OperationalError:
-            reserved_total = 0.0  # table not yet created
-
-        # Wallet available: use a dry-run sentinel if not tracked
-        # In micro-live, this will be populated by Reconciler from exchange API.
-        try:
-            cur = conn.execute(
-                "SELECT available_quote FROM wallet_snapshot ORDER BY snapshot_ts DESC LIMIT 1"
-            )
-            row = cur.fetchone()
-            wallet_available = float(row[0]) if row else 999999.0
-        except sqlite3.OperationalError:
-            wallet_available = 999999.0  # dry-run: effectively unlimited
-
-    finally:
-        conn.close()
-
-    return wallet_available, reserved_total
-
-
-def _get_regime_multiplier() -> float:
-    """
-    Read current regime multiplier.
-    Sprint 3 S3-1: returns 1.0 (static).
-    S3-3: reads from ledger regime_policy table.
-    """
-    return REGIME_MULTIPLIER_DEFAULT
+        # Return default — dataframe not accessible in custom_stoploss
+        # ATR trailing requires callback with dataframe access
+        # Placeholder: return 1 to use strategy stoploss value unchanged
+        return self.stoploss

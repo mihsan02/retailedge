@@ -5,6 +5,7 @@ services:
     container_name: retailedge_freqtrade
     volumes:
       - "./freqtrade/user_data:/freqtrade/user_data"
+      - "./ledger:/freqtrade/ledger"
     ports:
       - "127.0.0.1:8080:8080"
     command: >
