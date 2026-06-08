@@ -125,10 +125,10 @@ class ReconcilerLedger:
                 updated_ts  = excluded.updated_ts
             """,
             (
-                _s(order.get("id")),
+                _s(order.get("id") or order.get("order_id")),
                 _s(order.get("trade_id")),
                 _s(order.get("symbol") or order.get("pair") or "UNKNOWN"),
-                _s(order.get("side", "")),
+                _s(order.get("side") or order.get("ft_order_side") or ""),
                 _s(order.get("type") or order.get("order_type")),
                 _s(order.get("status", "open")),
                 _f(order.get("amount")),
@@ -360,15 +360,21 @@ class Reconciler:
                         self._loop_count, len(open_trades), summary["orders_upserted"])
 
             # Step 4: process fills from all trades
+            # Use same field normalization as Step 3 — order_id (not id), ft_order_side (not side).
             for trade in all_trades:
                 trade_orders = trade.get("orders", [])
                 for order in trade_orders:
+                    # Normalize: prefer order_id over id
                     order_id = _s(order.get("order_id") or order.get("id"))
                     if not order_id:
                         continue
 
-                    # Upsert the order record from trade context
+                    # Upsert with normalized fields — same as Step 3
                     order_for_upsert = dict(order)
+                    if "id" not in order_for_upsert or not order_for_upsert["id"]:
+                        order_for_upsert["id"] = order_id
+                    if "side" not in order_for_upsert or not order_for_upsert["side"]:
+                        order_for_upsert["side"] = order.get("ft_order_side", "")
                     order_for_upsert.setdefault("trade_id", _s(trade.get("trade_id") or trade.get("id")))
                     order_for_upsert.setdefault("symbol", trade.get("pair"))
                     try:
