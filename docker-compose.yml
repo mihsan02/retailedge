@@ -1,32 +1,95 @@
+version: "3.8"
+
+# RetailEdge — Docker Compose S3-R3
+#
+# Design:
+# 1. Repo root mounted as /workdir in all sidecar containers.
+#    PYTHONPATH=/workdir -> `from sidecar.X import Y` resolves correctly.
+# 2. Freqtrade healthcheck on /api/v1/ping.
+#    Sidecar services use condition: service_healthy — do not start until
+#    Freqtrade REST is actually responding.
+# 3. FREQTRADE_API_URL overridden to http://freqtrade:8080 in environment block.
+#    Value in .env may still say localhost — environment block wins over env_file.
+# 4. guardian.py has __main__ block at line 392 — run directly.
+#    reconciler.py and alerting.py do not — use run_reconciler.py and run_alerting.py.
+# 5. pip install on startup — acceptable for B1 dev workflow.
+#    Replace with custom image build post-B1 to eliminate startup delay.
+
 services:
   freqtrade:
     image: freqtradeorg/freqtrade:2026.3_freqai
-    restart: unless-stopped
     container_name: retailedge_freqtrade
+    ports:
+      - "8080:8080"
     volumes:
       - "./freqtrade/user_data:/freqtrade/user_data"
       - "./ledger:/freqtrade/ledger"
-    ports:
-      - "127.0.0.1:8080:8080"
+    env_file: .env
     command: >
       trade
-      --logfile /freqtrade/user_data/logs/freqtrade.log
-      --db-url sqlite:////freqtrade/user_data/tradesv3.sqlite
       --config /freqtrade/user_data/config.json
       --strategy RetailEdgeStrategy
-    env_file:
-      - .env
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -f -s -u ${FREQTRADE_API_USER}:${FREQTRADE_API_PASS} http://localhost:8080/api/v1/ping || exit 1",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 60s
+    restart: unless-stopped
 
-  sidecar:
+  guardian:
     image: python:3.11-slim
-    container_name: retailedge_sidecar
+    container_name: retailedge_guardian
     volumes:
-      - "./sidecar:/app"
-      - "./ledger:/ledger"
-    working_dir: /app
-    command: sleep infinity
+      - ".:/workdir"
+    working_dir: /workdir
+    environment:
+      - PYTHONPATH=/workdir
+      - FREQTRADE_API_URL=http://freqtrade:8080
+    env_file: .env
+    command: >
+      sh -c "pip install --quiet -r /workdir/sidecar/requirements.txt &&
+             python /workdir/sidecar/guardian/guardian.py"
     depends_on:
-      - freqtrade
-    env_file:
-      - .env
+      freqtrade:
+        condition: service_healthy
+    restart: unless-stopped
+
+  reconciler:
+    image: python:3.11-slim
+    container_name: retailedge_reconciler
+    volumes:
+      - ".:/workdir"
+    working_dir: /workdir
+    environment:
+      - PYTHONPATH=/workdir
+      - FREQTRADE_API_URL=http://freqtrade:8080
+    env_file: .env
+    command: >
+      sh -c "pip install --quiet -r /workdir/sidecar/requirements.txt &&
+             python /workdir/sidecar/run_reconciler.py"
+    depends_on:
+      freqtrade:
+        condition: service_healthy
+    restart: unless-stopped
+
+  alerting:
+    image: python:3.11-slim
+    container_name: retailedge_alerting
+    volumes:
+      - ".:/workdir"
+    working_dir: /workdir
+    environment:
+      - PYTHONPATH=/workdir
+    env_file: .env
+    command: >
+      sh -c "pip install --quiet -r /workdir/sidecar/requirements.txt &&
+             python /workdir/sidecar/run_alerting.py"
+    depends_on:
+      freqtrade:
+        condition: service_healthy
     restart: unless-stopped

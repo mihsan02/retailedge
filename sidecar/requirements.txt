@@ -1,0 +1,15 @@
+# sidecar/requirements.txt
+# Dependencies for all sidecar components.
+# Pinned to minor version only.
+
+# HTTP — ft_client.py, alerting.py (Telegram), emergency_exit.py
+requests>=2.31,<3.0
+
+# Data — reconciler.py, health_monitor, regime_policy, atr_percentile_service
+pandas>=2.0,<3.0
+numpy>=1.24,<2.0
+
+# Feather format — research/worker.py loads .feather from Freqtrade data dir
+pyarrow>=12.0,<20.0
+
+# SQLite is stdlib — no extra package needed.
