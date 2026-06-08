@@ -1,5 +1,5 @@
 {
-  "strategy_id": "retail_edge_v1",
+  "strategy_id": "trend_pullback_v1",
   "model_id": "bucket_baseline_dry_run_001",
   "model_type": "bucket_baseline",
   "model_hash": "sha256:DRY_RUN_PLACEHOLDER",
@@ -8,8 +8,8 @@
   "regime_policy_hash": "sha256:DRY_RUN_PLACEHOLDER",
   "venue_key": "binance_spot_usdt",
   "approved_by": "operator",
-  "approved_at": "2026-06-04T07:00:00Z",
+  "approved_at": "2026-06-04T23:36:19.473789+00:00",
   "promotion_source": "manual",
-  "rollback_model_id": null,
+  "rollback_model_id": "drill_new_model_20260605_001",
   "challenger_live": false
 }
