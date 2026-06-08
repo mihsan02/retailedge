@@ -20,16 +20,21 @@ CREATE TABLE IF NOT EXISTS system_actions (
 
 -- 2. All orders placed by Freqtrade
 CREATE TABLE IF NOT EXISTS execution_orders (
-    order_id TEXT PRIMARY KEY,
-    trade_id TEXT NOT NULL,
-    pair TEXT NOT NULL,
-    side TEXT NOT NULL,
-    order_type TEXT NOT NULL,
-    price REAL,
-    amount REAL,
-    status TEXT NOT NULL,
-    created_ts TEXT NOT NULL,
-    updated_ts TEXT
+    order_id    TEXT PRIMARY KEY,
+    trade_id    TEXT NOT NULL,
+    pair        TEXT NOT NULL,
+    side        TEXT NOT NULL,
+    order_type  TEXT NOT NULL,
+    price       REAL,
+    amount      REAL,
+    filled      REAL DEFAULT 0.0,
+    remaining   REAL,
+    average     REAL,
+    cost        REAL DEFAULT 0.0,
+    fee_quote   REAL DEFAULT 0.0,
+    status      TEXT NOT NULL,
+    created_ts  TEXT NOT NULL,
+    updated_ts  TEXT
 );
 
 -- 3. Fill events — deduplicated by order_id + fill_id

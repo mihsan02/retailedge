@@ -12,6 +12,7 @@ version: "3.8"
 #    Value in .env may still say localhost — environment block wins over env_file.
 # 4. guardian.py has __main__ block at line 392 — run directly.
 #    reconciler.py and alerting.py do not — use run_reconciler.py and run_alerting.py.
+#    health_monitor/monitor.py does not — use run_health_monitor.py.
 # 5. pip install on startup — acceptable for B1 dev workflow.
 #    Replace with custom image build post-B1 to eliminate startup delay.
 
@@ -91,6 +92,25 @@ services:
     command: >
       sh -c "pip install --quiet -r /workdir/sidecar/requirements.txt &&
              python /workdir/sidecar/run_alerting.py"
+    depends_on:
+      freqtrade:
+        condition: service_healthy
+    restart: unless-stopped
+
+  health_monitor:
+    image: python:3.11-slim
+    container_name: retailedge_health_monitor
+    volumes:
+      - ".:/workdir"
+    working_dir: /workdir
+    environment:
+      - PYTHONPATH=/workdir
+      - LEDGER_DB_PATH=/workdir/ledger/retailedge.db
+      - HEALTH_MONITOR_INTERVAL_SEC=3600
+    env_file: .env
+    command: >
+      sh -c "pip install --quiet -r /workdir/sidecar/requirements.txt &&
+             python /workdir/sidecar/run_health_monitor.py"
     depends_on:
       freqtrade:
         condition: service_healthy
