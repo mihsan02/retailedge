@@ -308,37 +308,59 @@ class Reconciler:
         }
 
         try:
-            # Step 1: open orders
+            # Step 1: open trades from /api/v1/status (returns list of trade objects)
+            # Each trade object contains an 'orders' list with individual order records.
             try:
-                open_orders_resp = self.ft.get_open_orders()
-                open_orders = self._extract_list(open_orders_resp, "orders")
+                open_trades_resp = self.ft.get_open_orders()
+                open_trades = self._extract_list(open_trades_resp, "trades")
             except Exception as exc:
-                logger.warning("Failed to fetch open orders: %s", exc)
-                summary["errors"].append(f"open_orders:{exc}")
-                open_orders = []
+                logger.warning("Failed to fetch open trades: %s", exc)
+                summary["errors"].append(f"open_trades:{exc}")
+                open_trades = []
 
-            # Step 2: trades (closed + open, source of fill events)
+            # Step 2: closed trades from /api/v1/trades for fill history
             try:
                 trades_resp = self.ft.get_trades()
-                trades = self._extract_list(trades_resp, "trades")
+                closed_trades = self._extract_list(trades_resp, "trades")
             except Exception as exc:
-                logger.warning("Failed to fetch trades: %s", exc)
+                logger.warning("Failed to fetch closed trades: %s", exc)
                 summary["errors"].append(f"trades:{exc}")
-                trades = []
+                closed_trades = []
 
-            # Step 3: upsert orders
-            for order in open_orders:
-                try:
-                    self.ledger.upsert_order(order)
-                    summary["orders_upserted"] += 1
-                except Exception as exc:
-                    logger.warning("Failed to upsert order %s: %s", order.get("id"), exc)
-                    summary["errors"].append(f"upsert_order:{exc}")
+            # Merge: process open trades first, then closed trades
+            all_trades = open_trades + closed_trades
 
-            # Step 4: process fills from trades
-            # Freqtrade /trades returns trade objects which may contain
-            # an 'orders' list with individual order/fill records.
-            for trade in trades:
+            # Step 3: extract order objects from trade objects and upsert
+            # /api/v1/status returns trade objects, not order objects.
+            # Each trade has an 'orders' list — those are the actual order records.
+            # Field normalization required: Freqtrade status uses 'order_id' and
+            # 'ft_order_side', not 'id' and 'side'. upsert_order reads 'id' and 'side'.
+            open_orders = []  # flat list of order objects for reserved_funds update
+            for trade in open_trades:
+                for order in trade.get("orders", []):
+                    order_for_upsert = dict(order)
+                    # Normalize: status response uses 'order_id', upsert_order reads 'id'
+                    if "id" not in order_for_upsert or not order_for_upsert["id"]:
+                        order_for_upsert["id"] = order.get("order_id", "")
+                    # Normalize: status response uses 'ft_order_side', upsert_order reads 'side'
+                    if "side" not in order_for_upsert or not order_for_upsert["side"]:
+                        order_for_upsert["side"] = order.get("ft_order_side", "")
+                    # Normalize: status response uses 'order_type' already — confirm
+                    order_for_upsert.setdefault("trade_id", str(trade.get("trade_id") or trade.get("id", "")))
+                    order_for_upsert.setdefault("symbol", trade.get("pair"))
+                    try:
+                        self.ledger.upsert_order(order_for_upsert)
+                        summary["orders_upserted"] += 1
+                        open_orders.append(order_for_upsert)
+                    except Exception as exc:
+                        logger.warning("Failed to upsert order %s: %s", order.get("order_id"), exc)
+                        summary["errors"].append(f"upsert_order:{exc}")
+
+            logger.info("Reconciler cycle %s: open_trades=%s orders_upserted=%s",
+                        self._loop_count, len(open_trades), summary["orders_upserted"])
+
+            # Step 4: process fills from all trades
+            for trade in all_trades:
                 trade_orders = trade.get("orders", [])
                 for order in trade_orders:
                     order_id = _s(order.get("order_id") or order.get("id"))
