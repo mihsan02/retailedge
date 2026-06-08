@@ -88,9 +88,11 @@ class FreqtradeClient:
         """GET /api/v1/trades — reconciler trade state sync."""
         return self._get("/api/v1/trades")
 
-    def get_open_orders(self) -> dict[str, Any]:
-        """GET /api/v1/openorders — reconciler open order sync."""
-        return self._get("/api/v1/openorders")
+    def get_open_orders(self) -> list:
+        """GET /api/v1/status — returns list of open trades (Freqtrade has no /openorders endpoint).
+        NOTE: /api/v1/status returns a list directly, not a dict with 'orders' key.
+        """
+        return self._get("/api/v1/status")
 
     def get_status(self) -> dict[str, Any]:
         """GET /api/v1/status — current open trade status."""
