@@ -25,6 +25,8 @@ services:
       - "./freqtrade/user_data:/freqtrade/user_data"
       - "./ledger:/freqtrade/ledger"
     env_file: .env
+    environment:
+      - LEDGER_DB_PATH=/freqtrade/ledger/retailedge.db
     command: >
       trade
       --config /freqtrade/user_data/config.json
