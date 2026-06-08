@@ -28,9 +28,20 @@ def ledger():
 
 
 def make_ft_client(open_orders=None, trades=None):
-    """Mock FreqtradeClient returning controlled data."""
+    """Mock FreqtradeClient returning controlled data.
+
+    get_open_orders() maps to /api/v1/status which returns trade objects,
+    each containing an 'orders' list. open_orders are wrapped into a single
+    mock trade object to match live Freqtrade response shape.
+    get_trades() returns {"trades": [...]} directly.
+    """
     ft = MagicMock()
-    ft.get_open_orders.return_value = {"orders": open_orders or []}
+    if open_orders:
+        pair = open_orders[0].get("symbol", "BTC/USDT")
+        wrapped = {"trade_id": "mock_trade_1", "pair": pair, "orders": open_orders}
+        ft.get_open_orders.return_value = {"trades": [wrapped]}
+    else:
+        ft.get_open_orders.return_value = {"trades": []}
     ft.get_trades.return_value = {"trades": trades or []}
     return ft
 
@@ -273,8 +284,8 @@ def test_order_status_updated_on_subsequent_run(ledger):
 
     assert ledger.get_order("order_upd_1")["status"] == "open"
 
-    # Second run: order now closed
-    ft.get_open_orders.return_value = {"orders": [order_closed]}
+    # Second run: order now closed — wrap in trade object (live Freqtrade format)
+    ft.get_open_orders.return_value = {"trades": [{"trade_id": "mock_trade_1", "pair": "BTC/USDT", "orders": [order_closed]}]}
     reconciler.run_once()
 
     updated = ledger.get_order("order_upd_1")
