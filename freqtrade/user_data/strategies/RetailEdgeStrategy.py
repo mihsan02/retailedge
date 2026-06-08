@@ -44,7 +44,13 @@ LEDGER_DB_PATH = os.environ.get(
     "LEDGER_DB_PATH", "/freqtrade/ledger/retailedge.db"
 )
 STRATEGY_MEMORY_STAGE = "REAL_DATA_OOS"
-ATR_MIN_LOOKBACK = 5000
+# ATR_MIN_LOOKBACK: temporarily set to 1000 (matches Binance 15m API limit).
+# Blueprint v1.9 Section 6 Step 6 specifies 5000 as the ideal minimum.
+# This is a known deviation — must be raised to 5000 once sufficient
+# historical data is available and startup_candle_count can be satisfied
+# without hitting exchange API limits.
+# INVARIANT: this value must match ATR_MIN_LOOKBACK in research/worker.py.
+ATR_MIN_LOOKBACK = 1000
 ATR_HIGH_VOLATILITY_THRESHOLD = 0.80  # CLAUDE.md Hard Constraint #6
 
 
@@ -170,6 +176,10 @@ class RetailEdgeStrategy(IStrategy):
     # Freqtrade strategy parameters
     timeframe = "15m"
     can_short = False
+
+    # Startup candles — must match ATR_MIN_LOOKBACK so Gate 3 never blocks on insufficient history
+    # Must be >= ATR_MIN_LOOKBACK. Set to 1000 to match Binance 15m API limit.
+    startup_candle_count: int = 1000
 
     # Stoploss — exchange-side stop handles actual exit
     stoploss = -0.05
