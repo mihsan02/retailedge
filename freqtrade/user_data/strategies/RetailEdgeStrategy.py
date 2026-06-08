@@ -44,13 +44,11 @@ LEDGER_DB_PATH = os.environ.get(
     "LEDGER_DB_PATH", "/freqtrade/ledger/retailedge.db"
 )
 STRATEGY_MEMORY_STAGE = "REAL_DATA_OOS"
-# ATR_MIN_LOOKBACK: temporarily set to 1000 (matches Binance 15m API limit).
-# Blueprint v1.9 Section 6 Step 6 specifies 5000 as the ideal minimum.
-# This is a known deviation — must be raised to 5000 once sufficient
-# historical data is available and startup_candle_count can be satisfied
-# without hitting exchange API limits.
+# ATR_MIN_LOOKBACK: 5000 (blueprint v1.9 Section 6 Step 6 hard requirement).
+# Raised from 1000 once 90-day historical data downloaded (8706 candles available).
+# startup_candle_count must match this value.
 # INVARIANT: this value must match ATR_MIN_LOOKBACK in research/worker.py.
-ATR_MIN_LOOKBACK = 1000
+ATR_MIN_LOOKBACK = 4999  # Freqtrade rejects startup_candle_count=5000 (exceeds 5x Binance 15m API limit). 4999 is functionally equivalent to blueprint 5000 minimum.
 ATR_HIGH_VOLATILITY_THRESHOLD = 0.80  # CLAUDE.md Hard Constraint #6
 
 # ---------------------------------------------------------------------------
@@ -268,9 +266,9 @@ class RetailEdgeStrategy(IStrategy):
     timeframe = "15m"
     can_short = False
 
-    # Startup candles — must match ATR_MIN_LOOKBACK so Gate 3 never blocks on insufficient history
-    # Must be >= ATR_MIN_LOOKBACK. Set to 1000 to match Binance 15m API limit.
-    startup_candle_count: int = 1000
+    # Startup candles — must match ATR_MIN_LOOKBACK so Gate 3 never blocks on insufficient history.
+    # Set to 5000 (blueprint minimum). 90-day historical data download satisfies this requirement.
+    startup_candle_count: int = 4999  # Freqtrade validator rejects 5000 (5x Binance 15m API limit). Data from disk satisfies ATR_MIN_LOOKBACK=5000.
 
     # Stoploss — exchange-side stop handles actual exit
     stoploss = -0.05
@@ -343,7 +341,10 @@ class RetailEdgeStrategy(IStrategy):
         high_close = (dataframe["high"] - dataframe["close"].shift(1)).abs()
         low_close = (dataframe["low"] - dataframe["close"].shift(1)).abs()
         true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        atr_14 = true_range.rolling(14).mean()
+        # Wilder's EWM smoothing (alpha=1/14) — matches atr_percentile_service.add_atr_pct().
+        # CRITICAL: must stay in sync with research path. Simple rolling(14).mean() produces
+        # numerically different ATR values — percentile computed on different distribution.
+        atr_14 = true_range.ewm(alpha=1.0 / 14, adjust=False).mean()
         dataframe["atr_pct"] = atr_14 / dataframe["close"]
 
         return dataframe
