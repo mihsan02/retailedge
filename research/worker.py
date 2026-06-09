@@ -30,6 +30,11 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+from research.atr_percentile_service import add_atr_pct
+from research.atr_percentile_service import (
+    add_atr_pct,
+    compute_atr_percentile_baseline,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +61,9 @@ DEFAULT_DATA_DIR = "freqtrade/user_data/data/binance"
 DEFAULT_TIMEFRAME = "15m"
 DEFAULT_PAIRS = ["BTC/USDT", "ETH/USDT"]
 FORMAT_EXTENSIONS = ["json", "feather", "parquet"]
+# Trailing window for ATR percentile gate. Must equal RetailEdgeStrategy.ATR_MIN_LOOKBACK.
+# INVARIANT: changing this without changing the strategy breaks train-serve parity.
+ATR_PERCENTILE_LOOKBACK = 4999
 
 
 # ---------------------------------------------------------------------------
@@ -264,13 +272,9 @@ def compute_bucket_features(df: pd.DataFrame) -> pd.DataFrame:
     # Momentum: 5-candle log return
     df["momentum_5"] = np.log(df["close"] / df["close"].shift(5))
 
-    # ATR percentile input: ATR / close (normalized)
-    high_low = df["high"] - df["low"]
-    high_close = (df["high"] - df["close"].shift(1)).abs()
-    low_close = (df["low"] - df["close"].shift(1)).abs()
-    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    atr_14 = true_range.rolling(14).mean()
-    df["atr_pct"] = atr_14 / df["close"]
+    # ATR percentile input: delegate to canonical Wilder ewm helper.
+    # Single source of truth shared with live strategy. Do not open-code ATR here.
+    df = add_atr_pct(df)
 
     # Forward return (1 candle ahead) — OOS target
     df["fwd_return"] = df["close"].shift(-1) / df["close"] - 1
@@ -282,6 +286,7 @@ def run_oos_validation(
     df: pd.DataFrame,
     train_ratio: float = 0.8,
     cost_floor_pct: float = 0.0046,
+    atr_lookback: int = ATR_PERCENTILE_LOOKBACK,
 ) -> dict:
     """
     Simple 80/20 OOS validation.
@@ -321,11 +326,10 @@ def run_oos_validation(
             "cost_floor_cleared": False,
         }
 
-    # Apply to OOS
+    # Momentum signals on OOS (pre-gate)
     oos_signals = oos[oos["momentum_5"] > best_threshold].copy()
-    trade_count = len(oos_signals)
 
-    if trade_count == 0:
+    if len(oos_signals) == 0:
         return {
             "status": "NO_OOS_SIGNALS",
             "threshold_long": float(best_threshold),
@@ -333,11 +337,46 @@ def run_oos_validation(
             "win_rate": 0.0,
             "avg_pnl_pct": 0.0,
             "cost_floor_cleared": False,
+            "regime_gated": True,
         }
 
-    win_rate = float((oos_signals["fwd_return"] > 0).mean())
-    avg_pnl_pct = float(oos_signals["fwd_return"].mean())
+    # F2 parity gate: keep only rows live would actually enter.
+    # Live blocks entry when trailing ATR percentile >= HIGH_VOL_THRESHOLD (0.80).
+    # Each row evaluated causally (history up to that row only) — no lookahead.
+    keep = []
+    for i in oos_signals.index:
+        res = compute_atr_percentile_baseline(df.iloc[: i + 1], min_lookback=atr_lookback)
+        if res["status"] == "OK" and not res["is_high_vol"]:
+            keep.append(i)
+
+    gated = oos_signals.loc[keep]
+    trade_count = len(gated)
+
+    if trade_count == 0:
+        return {
+            "status": "NO_OOS_SIGNALS_AFTER_GATE",
+            "threshold_long": float(best_threshold),
+            "trade_count": 0,
+            "win_rate": 0.0,
+            "avg_pnl_pct": 0.0,
+            "cost_floor_cleared": False,
+            "regime_gated": True,
+        }
+
+    win_rate = float((gated["fwd_return"] > 0).mean())
+    avg_pnl_pct = float(gated["fwd_return"].mean())
     cost_floor_cleared = avg_pnl_pct > cost_floor_pct
+
+    return {
+        "status": "OK",
+        "threshold_long": float(best_threshold),
+        "trade_count": trade_count,
+        "win_rate": round(win_rate, 4),
+        "avg_pnl_pct": round(avg_pnl_pct, 6),
+        "cost_floor_cleared": cost_floor_cleared,
+        "regime_gated": True,
+        "min_sample_ok": trade_count >= 30,
+    }
 
     return {
         "status": "OK",
